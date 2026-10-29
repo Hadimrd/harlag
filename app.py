@@ -101,7 +101,7 @@ def health():
 def probe(url: str, request: Request):
     rate_limit(request)
     info = get_info(url)
-    return {"url":url,"title":info.get("title") or "بدون عنوان","duration":info.get("duration") or 0,
+    return {"url":url,"title":info.get("title") or "بدون عنوان","caption":info.get("description") or info.get("title") or "","duration":info.get("duration") or 0,
             "thumbnail":info.get("thumbnail") or "","filesize":info.get("filesize") or info.get("filesize_approx") or 0,
             "artist":info.get("artist") or info.get("creator"),"song":info.get("track"),"formats":FORMATS}
 
