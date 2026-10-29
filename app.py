@@ -381,6 +381,45 @@ async def identify(url: str, request: Request):
             except Exception:
                 media_duration = 0.0
 
+        base = str(request.base_url).rstrip("/")
+        # Make the complete audio track of the user-supplied clip available as MP3.
+        # This is the clip's audio, not a download of the full commercial song.
+        clip_audio_url = None
+        clip_audio_size = 0
+        clip_audio_filename = "clip-audio.mp3"
+        try:
+            clip_audio_folder = MEDIA_DIR / ("clip-audio-" + uuid.uuid4().hex)
+            clip_audio_folder.mkdir(parents=True, exist_ok=False)
+            clip_audio_path = clip_audio_folder / "clip-audio.mp3"
+            await asyncio.to_thread(
+                subprocess.run,
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-threads", "1",
+                 "-i", str(source_path), "-t", str(min(media_duration or 1800.0, 1800.0)),
+                 "-vn", "-codec:a", "libmp3lame", "-b:a", "128k", str(clip_audio_path)],
+                check=True, capture_output=True, text=True, timeout=120,
+            )
+            if clip_audio_path.exists() and 1000 < clip_audio_path.stat().st_size <= MAX_BYTES:
+                clip_token = secrets.token_hex(24)
+                clip_audio_size = clip_audio_path.stat().st_size
+                clip_audio_filename = safe_filename("Audio from supplied clip", "mp3")
+                FILES[clip_token] = {
+                    "path": clip_audio_path,
+                    "directory": clip_audio_folder,
+                    "expires": time.time() + FILE_TTL,
+                    "filename": clip_audio_filename,
+                    "ext": ".mp3",
+                    "source_url": url,
+                    "is_preview": True,
+                }
+                clip_audio_url = base + "/files/" + clip_token
+            else:
+                shutil.rmtree(clip_audio_folder, ignore_errors=True)
+        except Exception as exc:
+            print(f"full_clip_audio_failed error={type(exc).__name__}: {str(exc)[:120]}")
+            try:
+                shutil.rmtree(clip_audio_folder, ignore_errors=True)
+            except Exception:
+                pass
         # Listen across the whole clip. Songs often start after speech; a remix or
         # an instrumental section may be audible only in the middle/end.
         offsets = [0.0]
@@ -441,52 +480,13 @@ async def identify(url: str, request: Request):
 
         if not recognized_tracks:
             print(f"song_identification_no_match host={urlparse(url).hostname} windows={len(offsets)}")
-            return {"recognized": False, "matches": [], "message": "NO_CONFIDENT_MATCH"}
+            return {"recognized": False, "matches": [], "message": "NO_CONFIDENT_MATCH", "clip_audio_url": clip_audio_url, "clip_audio_size": clip_audio_size, "clip_audio_filename": clip_audio_filename, "clip_audio_duration_seconds": min(media_duration or 0, 1800)}
 
         candidates = sorted(
             recognized_tracks.values(),
             key=lambda item: (item["hits"], -item["offset"]),
             reverse=True,
         )[:4]
-        base = str(request.base_url).rstrip("/")
-        # Make the complete audio track of the user-supplied clip available as MP3.
-        # This is the clip's audio, not a download of the full commercial song.
-        clip_audio_url = None
-        clip_audio_size = 0
-        clip_audio_filename = "clip-audio.mp3"
-        try:
-            clip_audio_folder = MEDIA_DIR / ("clip-audio-" + uuid.uuid4().hex)
-            clip_audio_folder.mkdir(parents=True, exist_ok=False)
-            clip_audio_path = clip_audio_folder / "clip-audio.mp3"
-            await asyncio.to_thread(
-                subprocess.run,
-                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-threads", "1",
-                 "-i", str(source_path), "-t", str(min(media_duration or 1800.0, 1800.0)),
-                 "-vn", "-codec:a", "libmp3lame", "-b:a", "128k", str(clip_audio_path)],
-                check=True, capture_output=True, text=True, timeout=120,
-            )
-            if clip_audio_path.exists() and 1000 < clip_audio_path.stat().st_size <= MAX_BYTES:
-                clip_token = secrets.token_hex(24)
-                clip_audio_size = clip_audio_path.stat().st_size
-                clip_audio_filename = safe_filename("Audio from supplied clip", "mp3")
-                FILES[clip_token] = {
-                    "path": clip_audio_path,
-                    "directory": clip_audio_folder,
-                    "expires": time.time() + FILE_TTL,
-                    "filename": clip_audio_filename,
-                    "ext": ".mp3",
-                    "source_url": url,
-                    "is_preview": True,
-                }
-                clip_audio_url = base + "/files/" + clip_token
-            else:
-                shutil.rmtree(clip_audio_folder, ignore_errors=True)
-        except Exception as exc:
-            print(f"full_clip_audio_failed error={type(exc).__name__}: {str(exc)[:120]}")
-            try:
-                shutil.rmtree(clip_audio_folder, ignore_errors=True)
-            except Exception:
-                pass
         matches = []
         for index, item in enumerate(candidates):
             track = item["track"]
