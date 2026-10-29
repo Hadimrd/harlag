@@ -1,4 +1,4 @@
-import os, re, time, uuid, secrets, shutil, ipaddress, subprocess, json, asyncio, threading
+import os, re, time, uuid, secrets, shutil, ipaddress, subprocess, json, asyncio, threading, base64
 from pathlib import Path
 from urllib.parse import urlparse, quote_plus
 from urllib.request import Request as URLRequest, urlopen
@@ -118,14 +118,35 @@ def _is_youtube(url: str) -> bool:
     return any(host == h or host.endswith("." + h) for h in YOUTUBE_HOSTS)
 
 
+def _youtube_cookie_file():
+    """Load optional owner-supplied Netscape-format cookies from Render env vars."""
+    encoded = (os.environ.get("YOUTUBE_COOKIES_B64") or "").strip()
+    raw = os.environ.get("YOUTUBE_COOKIES") or ""
+    if not encoded and not raw:
+        return None
+    try:
+        data = base64.b64decode(encoded, validate=True).decode("utf-8") if encoded else raw
+        if not data.strip() or (".youtube.com" not in data and "youtube.com" not in data):
+            print("youtube_cookie_config_invalid=unexpected_format")
+            return None
+        cookie_path = Path("/tmp/cf-downloader-youtube-cookies.txt")
+        if not cookie_path.exists() or cookie_path.read_text(encoding="utf-8", errors="replace") != data:
+            cookie_path.write_text(data, encoding="utf-8")
+            cookie_path.chmod(0o600)
+        return str(cookie_path)
+    except Exception as exc:
+        print(f"youtube_cookie_config_invalid={type(exc).__name__}")
+        return None
+
+
 def _extractor_profiles(url: str):
-    # YouTube increasingly challenges datacenter IPs. Try the TV/Safari clients
-    # first, then the default extractor profile; all other sites use the default.
+    # The external PO-token provider helps with token-required clients, but cannot
+    # remove IP-based bot checks. Try public clients first; cookies may be supplied
+    # by the service owner through a private Render environment variable if needed.
     if _is_youtube(url):
-        # The local bgutil provider can generate the PO tokens required by mweb/web clients.
-        # Keep the TV client as a fallback for videos with fewer supported formats.
         return [
             {"youtube": {"player_client": ["mweb", "tv", "web_safari"]}},
+            {"youtube": {"player_client": ["android_vr", "tv_simply", "tv"]}},
             {"youtube": {"player_client": ["web_embedded", "tv"]}},
             {"youtube": {"player_client": ["tv"]}},
             None,
@@ -161,6 +182,10 @@ def _extract_download(url: str, settings: dict, folder: Path):
             attempt_settings["extractor_args"] = extractor_args
         else:
             attempt_settings.pop("extractor_args", None)
+        if _is_youtube(url):
+            cookie_file = _youtube_cookie_file()
+            if cookie_file:
+                attempt_settings["cookiefile"] = cookie_file
         try:
             with YoutubeDL(attempt_settings) as ydl:
                 return ydl.extract_info(url, download=True)
@@ -179,6 +204,10 @@ def get_info(url: str):
         settings = opts(skip_download=True)
         if extractor_args:
             settings["extractor_args"] = extractor_args
+        if _is_youtube(url):
+            cookie_file = _youtube_cookie_file()
+            if cookie_file:
+                settings["cookiefile"] = cookie_file
         try:
             with YoutubeDL(settings) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -272,6 +301,7 @@ def health():
         "ok": True,
         "service": APP_NAME,
         "api_key_configured": bool(API_KEY),
+        "youtube_cookies_configured": bool(os.environ.get("YOUTUBE_COOKIES_B64") or os.environ.get("YOUTUBE_COOKIES")),
         "yt_dlp": "enabled",
         "music_recognition": "shazamio",
         "youtube_po_token_provider": provider,
@@ -419,6 +449,44 @@ async def identify(url: str, request: Request):
             reverse=True,
         )[:4]
         base = str(request.base_url).rstrip("/")
+        # Make the complete audio track of the user-supplied clip available as MP3.
+        # This is the clip's audio, not a download of the full commercial song.
+        clip_audio_url = None
+        clip_audio_size = 0
+        clip_audio_filename = "clip-audio.mp3"
+        try:
+            clip_audio_folder = MEDIA_DIR / ("clip-audio-" + uuid.uuid4().hex)
+            clip_audio_folder.mkdir(parents=True, exist_ok=False)
+            clip_audio_path = clip_audio_folder / "clip-audio.mp3"
+            await asyncio.to_thread(
+                subprocess.run,
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-threads", "1",
+                 "-i", str(source_path), "-t", str(min(media_duration or 1800.0, 1800.0)),
+                 "-vn", "-codec:a", "libmp3lame", "-b:a", "128k", str(clip_audio_path)],
+                check=True, capture_output=True, text=True, timeout=120,
+            )
+            if clip_audio_path.exists() and 1000 < clip_audio_path.stat().st_size <= MAX_BYTES:
+                clip_token = secrets.token_hex(24)
+                clip_audio_size = clip_audio_path.stat().st_size
+                clip_audio_filename = safe_filename("Audio from supplied clip", "mp3")
+                FILES[clip_token] = {
+                    "path": clip_audio_path,
+                    "directory": clip_audio_folder,
+                    "expires": time.time() + FILE_TTL,
+                    "filename": clip_audio_filename,
+                    "ext": ".mp3",
+                    "source_url": url,
+                    "is_preview": True,
+                }
+                clip_audio_url = base + "/files/" + clip_token
+            else:
+                shutil.rmtree(clip_audio_folder, ignore_errors=True)
+        except Exception as exc:
+            print(f"full_clip_audio_failed error={type(exc).__name__}: {str(exc)[:120]}")
+            try:
+                shutil.rmtree(clip_audio_folder, ignore_errors=True)
+            except Exception:
+                pass
         matches = []
         for index, item in enumerate(candidates):
             track = item["track"]
@@ -483,6 +551,10 @@ async def identify(url: str, request: Request):
             "youtube_url": first["youtube_url"],
             "lyrics_url": first["lyrics_url"],
             "preview_url": first["preview_url"],
+            "clip_audio_url": clip_audio_url,
+            "clip_audio_size": clip_audio_size,
+            "clip_audio_filename": clip_audio_filename,
+            "clip_audio_duration_seconds": min(media_duration or 0, 1800),
             "matches": matches,
         }
     except HTTPException:
