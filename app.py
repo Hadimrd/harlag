@@ -101,7 +101,7 @@ def health():
 def probe(url: str, request: Request):
     rate_limit(request)
     info = get_info(url)
-    return {"url":url,"title":info.get("title") or "بدون عنوان","caption":info.get("description") or info.get("title") or "","duration":info.get("duration") or 0,
+    return {"url":url,"title":info.get("title") or "بدون عنوان","caption":(info.get("description") or info.get("caption") or info.get("alt_title") or "").strip(),"duration":info.get("duration") or 0,
             "thumbnail":info.get("thumbnail") or "","filesize":info.get("filesize") or info.get("filesize_approx") or 0,
             "artist":info.get("artist") or info.get("creator"),"song":info.get("track"),"formats":FORMATS}
 
@@ -150,7 +150,7 @@ async def identify(url: str, request: Request):
             check=True, capture_output=True, text=True, timeout=30
         )
         async with Shazam() as shazam:
-            raw = await shazam.recognize(str(normalized_audio), max_skew=1e-3)
+            raw = await shazam.recognize(str(normalized_audio))
         if not raw or not raw.get("track"):
             return {"recognized": False, "message": "No confident song match"}
         track = Serialize.full_track(raw).track
@@ -185,8 +185,13 @@ def download(url: str, spec: str = "best", request: Request = None):
     token = uuid.uuid4().hex + secrets.token_hex(12)
     folder = MEDIA_DIR / token
     folder.mkdir(parents=True, exist_ok=False)
-    selectors = {"best":"bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b","1080":"bv*[height<=1080]+ba/b[height<=1080]",
-                 "720":"bv*[height<=720]+ba/b[height<=720]","480":"bv*[height<=480]+ba/b[height<=480]","mp3":"bestaudio/best"}
+    selectors = {
+        "best": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/best",
+        "1080": "bv*[height<=1080]+ba/b[height<=1080]/best[height<=1080]/best",
+        "720": "bv*[height<=720]+ba/b[height<=720]/best[height<=720]/best",
+        "480": "bv*[height<=480]+ba/b[height<=480]/best[height<=480]/best",
+        "mp3": "bestaudio/best",
+    }
     settings = opts(format=selectors[spec],outtmpl=str(folder/"%(id)s.%(ext)s"),max_filesize=MAX_BYTES,
                     restrictfilenames=True,merge_output_format="mp4",continuedl=False,nopart=True)
     if spec == "mp3":
@@ -200,11 +205,21 @@ def download(url: str, spec: str = "best", request: Request = None):
         path = max(files,key=lambda p:p.stat().st_size)
         size = path.stat().st_size
         if size > MAX_BYTES:
-            raise HTTPException(413,"File exceeds 100 MB limit")
+            raise HTTPException(413,"File exceeds 100 MB service limit")
         filename = safe_filename(info.get("title") or path.stem,path.suffix.lstrip("."))
         FILES[token]={"path":path,"directory":folder,"expires":time.time()+FILE_TTL,"filename":filename,"ext":path.suffix.lower()}
         base = str(request.base_url).rstrip("/") if request else ""
-        return {"file_url":base+"/files/"+token,"filename":filename,"size":size,"expires_in":FILE_TTL}
+        caption = (info.get("description") or info.get("caption") or info.get("alt_title") or "").strip()
+        return {
+            "file_url": base + "/files/" + token,
+            "filename": filename,
+            "size": size,
+            "title": info.get("title") or info.get("fulltitle") or filename,
+            "caption": caption,
+            "description": caption,
+            "duration": info.get("duration") or 0,
+            "expires_in": FILE_TTL,
+        }
     except HTTPException:
         shutil.rmtree(folder,ignore_errors=True)
         raise
