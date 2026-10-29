@@ -245,9 +245,59 @@ def _instagram_caption_fallback(url: str) -> str:
     return ""
 
 
+class _InstagramMetaParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.descriptions = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "meta":
+            return
+        values = dict(attrs)
+        key = (values.get("property") or values.get("name") or "").lower()
+        if key in ("og:description", "description", "twitter:description") and values.get("content"):
+            self.descriptions.append(values["content"])
+
+
+def _instagram_caption_fallback(url: str) -> str:
+    # Public Instagram pages sometimes expose the caption in embedded JSON.
+    try:
+        request = URLRequest(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.8",
+            },
+        )
+        with urlopen(request, timeout=4) as response:
+            page = response.read(1_500_000).decode("utf-8", "replace")
+    except Exception as exc:
+        print(f"instagram_caption_fallback_failed: {type(exc).__name__}")
+        return ""
+    patterns = (
+        r'"edge_media_to_caption"\s*:\s*\{.*?"text"\s*:\s*("(?:\\.|[^"\\])*")',
+        r'"caption"\s*:\s*\{\s*"text"\s*:\s*("(?:\\.|[^"\\])*")',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, page, re.S)
+        if match:
+            try:
+                caption = str(json.loads(match.group(1))).strip()
+                if caption:
+                    return caption[:4000]
+            except (ValueError, TypeError):
+                pass
+    parser = _InstagramMetaParser()
+    parser.feed(page)
+    for item in parser.descriptions:
+        value = unescape(item).strip()
+        if value and not value.lower().startswith(("log in", "instagram")):
+            return value[:4000]
+    return ""
+
+
 def media_caption(url: str, info: dict) -> str:
-    caption = media_caption(url, info)
-        print(f"download_ok host={urlparse(url).hostname} size={size} caption_chars={len(caption)}")
+    caption = (info.get("description") or info.get("caption") or info.get("alt_title") or "").strip()
     if not caption and _is_instagram_url(url):
         caption = _instagram_caption_fallback(url)
     return caption
@@ -458,7 +508,8 @@ def download(url: str, spec: str = "best", request: Request = None):
         filename = safe_filename(info.get("title") or path.stem,path.suffix.lstrip("."))
         FILES[token]={"path":path,"directory":folder,"expires":time.time()+FILE_TTL,"filename":filename,"ext":path.suffix.lower(),"source_url":url}
         base = str(request.base_url).rstrip("/") if request else ""
-        caption = (info.get("description") or info.get("caption") or info.get("alt_title") or "").strip()
+        caption = media_caption(url, info)
+        print(f"download_ok host={urlparse(url).hostname} size={size} caption_chars={len(caption)}")
         return {
             "file_url": base + "/files/" + token,
             "filename": filename,
