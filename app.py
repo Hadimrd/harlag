@@ -5,6 +5,7 @@ from urllib.parse import urlparse, quote_plus
 from fastapi import FastAPI, Header, HTTPException, Request, Depends
 from fastapi.responses import FileResponse
 from yt_dlp import YoutubeDL
+from yt_dlp.extractor import gen_extractor_classes
 from shazamio import Serialize, Shazam
 
 APP_NAME = "cf-downloader-api"
@@ -51,19 +52,49 @@ def auth(x_api_key: str | None = Header(default=None, alias="X-API-Key")):
     if not x_api_key or not secrets.compare_digest(x_api_key, API_KEY):
         raise HTTPException(401, "Unauthorized")
 
+SPECIFIC_EXTRACTORS = None
+DIRECT_MEDIA_EXTENSIONS = {
+    ".mp4", ".m4v", ".mov", ".webm", ".mkv", ".mp3", ".m4a",
+    ".aac", ".wav", ".ogg", ".opus", ".flac", ".avi", ".mpg", ".mpeg",
+    ".m3u8", ".mpd", ".ts", ".flv", ".wmv", ".3gp"
+}
+
+
+def _has_specific_extractor(url: str) -> bool:
+    global SPECIFIC_EXTRACTORS
+    if SPECIFIC_EXTRACTORS is None:
+        SPECIFIC_EXTRACTORS = tuple(
+            ie for ie in gen_extractor_classes()
+            if ie.__name__ not in ("GenericIE", "UnsupportedURLIE")
+        )
+    for ie in SPECIFIC_EXTRACTORS:
+        try:
+            if ie.suitable(url):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def validate_url(url: str):
     p = urlparse(url)
     if p.scheme not in ("http", "https") or not p.hostname or p.username or p.password or p.port not in (None,80,443):
-        raise HTTPException(400, "Invalid media URL")
+        raise HTTPException(400, "INVALID_MEDIA_URL")
     host = p.hostname.lower().rstrip(".")
-    if not any(host == h or host.endswith("." + h) for h in ALLOWED_HOSTS):
-        raise HTTPException(400, "Unsupported platform")
+    if host in ("localhost",) or host.endswith((".local", ".internal", ".localhost")):
+        raise HTTPException(400, "PRIVATE_HOST_NOT_ALLOWED")
     try:
         addr = ipaddress.ip_address(host)
         if not addr.is_global:
-            raise HTTPException(400, "Private addresses are not allowed")
+            raise HTTPException(400, "PRIVATE_ADDRESS_NOT_ALLOWED")
     except ValueError:
         pass
+    known_host = any(host == h or host.endswith("." + h) for h in ALLOWED_HOSTS)
+    direct_media = Path(p.path.lower()).suffix in DIRECT_MEDIA_EXTENSIONS
+    # Match every specific yt-dlp extractor, not only a short hard-coded list.
+    # GenericIE is intentionally excluded so arbitrary website URLs are not fetched blindly.
+    if not known_host and not direct_media and not _has_specific_extractor(url):
+        raise HTTPException(400, "UNSUPPORTED_PLATFORM")
 
 def rate_limit(request: Request):
     now = time.time()
