@@ -257,7 +257,22 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok":True,"service":APP_NAME,"api_key_configured":bool(API_KEY),"yt_dlp":"enabled","music_recognition":"shazamio"}
+    provider = {"ok": False, "version": None}
+    try:
+        with urlopen("http://127.0.0.1:4416/ping", timeout=1) as response:
+            if response.status == 200:
+                data = json.loads(response.read(4096).decode("utf-8", "replace"))
+                provider = {"ok": True, "version": data.get("version")}
+    except Exception as exc:
+        provider = {"ok": False, "error": type(exc).__name__}
+    return {
+        "ok": True,
+        "service": APP_NAME,
+        "api_key_configured": bool(API_KEY),
+        "yt_dlp": "enabled",
+        "music_recognition": "shazamio",
+        "youtube_po_token_provider": provider,
+    }
 
 @app.get("/probe", dependencies=[Depends(auth)])
 def probe(url: str, request: Request):
