@@ -1,0 +1,22 @@
+name: Keep Render API warm
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Ping public health endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          code="$(curl --silent --show-error --output /tmp/health.json --write-out '%{http_code}' --max-time 25 https://cf-downloader-api.onrender.com/health)"
+          cat /tmp/health.json
+          echo
+          test "$code" = "200"
