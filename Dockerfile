@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN git clone --depth 1 --branch 2.0.2 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil-ytdlp-pot-provider
 RUN cd /opt/bgutil-ytdlp-pot-provider/server && npm ci && npx tsc && npm prune --omit=dev
 
-FROM python:3.12-bookworm-slim
+FROM python:3.12-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg ca-certificates libstdc++6 libcairo2 libpango-1.0-0 libpangocairo-1.0-0 \
