@@ -1,4 +1,4 @@
-import os, re, time, uuid, secrets, shutil, ipaddress
+import os, re, time, uuid, secrets, shutil, ipaddress, subprocess
 from pathlib import Path
 from urllib.parse import urlparse, quote_plus
 
@@ -143,8 +143,14 @@ async def identify(url: str, request: Request):
         if not files:
             raise HTTPException(502, "Audio extraction produced no file")
         audio_path = max(files, key=lambda p: p.stat().st_size)
+        normalized_audio = folder / "shazam-sample.wav"
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(audio_path),
+             "-t", "12", "-vn", "-ac", "2", "-ar", "44100", "-f", "wav", str(normalized_audio)],
+            check=True, capture_output=True, text=True, timeout=30
+        )
         async with Shazam() as shazam:
-            raw = await shazam.recognize(str(audio_path), max_skew=1e-3)
+            raw = await shazam.recognize(str(normalized_audio), max_skew=1e-3)
         if not raw or not raw.get("track"):
             return {"recognized": False, "message": "No confident song match"}
         track = Serialize.full_track(raw).track
@@ -164,6 +170,7 @@ async def identify(url: str, request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        print(f"song identification failed ({type(e).__name__}): {str(e)[:300]}")
         raise HTTPException(422, "Song identification failed; try another public clip") from e
     finally:
         shutil.rmtree(folder, ignore_errors=True)
