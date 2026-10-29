@@ -18,4 +18,4 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
 ENV PORT=10000
-CMD ["sh", "-c", "node /opt/bgutil-ytdlp-pot-provider/server/build/main.js -H 127.0.0.1 >/tmp/bgutil-pot.log 2>&1 & sleep 1; uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000}"]
+CMD ["sh", "-c", "node /opt/bgutil-ytdlp-pot-provider/server/build/main.js -H 127.0.0.1 & sleep 2; uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000}"]
