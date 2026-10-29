@@ -1,4 +1,4 @@
-import os, re, time, uuid, secrets, shutil, ipaddress, subprocess, json
+import os, re, time, uuid, secrets, shutil, ipaddress, subprocess, json, asyncio
 from pathlib import Path
 from urllib.parse import urlparse, quote_plus
 from urllib.request import Request as URLRequest, urlopen
@@ -295,16 +295,15 @@ def recognize(url: str, request: Request):
 
 @app.get("/identify", dependencies=[Depends(auth)])
 async def identify(url: str, request: Request):
-    """Identify a track from several 12-second windows and return a short clip-derived audio sample."""
+    """Identify music from multiple sections of a clip, including instrumental passages."""
     rate_limit(request)
     clean_files()
     validate_url(url)
     folder = MEDIA_DIR / ("identify-" + uuid.uuid4().hex)
     folder.mkdir(parents=True, exist_ok=False)
-    preview_folder = None
-    preview_token = None
+    preview_folders = []
     try:
-        # Reuse the already-downloaded media where possible to avoid a second full download.
+        # Reuse media already fetched for this Telegram job so identification is faster.
         cached = next(
             (
                 item for item in FILES.values()
@@ -327,7 +326,7 @@ async def identify(url: str, request: Request):
                 continuedl=False,
                 nopart=True,
             )
-            info = _extract_download(url, settings, folder)
+            info = await asyncio.to_thread(_extract_download, url, settings, folder)
             audio_files = [
                 p for p in folder.iterdir()
                 if p.is_file() and not p.name.endswith((".part", ".ytdl", ".tmp", ".wav"))
@@ -339,7 +338,8 @@ async def identify(url: str, request: Request):
 
         if not media_duration:
             try:
-                probe_result = subprocess.run(
+                probe_result = await asyncio.to_thread(
+                    subprocess.run,
                     ["ffprobe", "-v", "error", "-show_entries", "format=duration",
                      "-of", "default=noprint_wrappers=1:nokey=1", str(source_path)],
                     check=True, capture_output=True, text=True, timeout=10,
@@ -348,88 +348,144 @@ async def identify(url: str, request: Request):
             except Exception:
                 media_duration = 0.0
 
-        # A song may begin after speech or an intro. Check up to three distinct 12 s windows.
+        # Listen across the whole clip. Songs often start after speech; a remix or
+        # an instrumental section may be audible only in the middle/end.
         offsets = [0.0]
-        if media_duration > 12:
-            offsets.extend([max(0.0, media_duration / 2 - 6), max(0.0, media_duration - 12)])
-        offsets = list(dict.fromkeys(round(x, 2) for x in offsets))[:3]
+        if media_duration > 15:
+            offsets.extend([
+                max(0.0, media_duration * 0.33 - 6),
+                max(0.0, media_duration * 0.66 - 6),
+                max(0.0, media_duration - 12),
+            ])
+        offsets = list(dict.fromkeys(round(x, 2) for x in offsets))[:4]
 
-        selected_offset = offsets[0]
-        selected_wav = None
-        raw = None
+        recognized_tracks = {}
         async with Shazam() as shazam:
             for index, offset in enumerate(offsets):
                 sample_wav = folder / f"sample-{index}.wav"
-                subprocess.run(
-                    [
-                        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                        "-ss", str(offset), "-i", str(source_path), "-t", "12",
-                        "-vn", "-ac", "2", "-ar", "44100", "-f", "wav", str(sample_wav),
-                    ],
-                    check=True, capture_output=True, text=True, timeout=30,
-                )
+                try:
+                    await asyncio.to_thread(
+                        subprocess.run,
+                        [
+                            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                            "-ss", str(offset), "-i", str(source_path), "-t", "12",
+                            "-vn", "-ac", "2", "-ar", "44100", "-af",
+                            "highpass=f=90,lowpass=f=9000", "-f", "wav", str(sample_wav),
+                        ],
+                        check=True, capture_output=True, text=True, timeout=30,
+                    )
+                except Exception as exc:
+                    print(f"audio_sample_failed offset={offset} error={type(exc).__name__}")
+                    continue
                 if not sample_wav.exists() or sample_wav.stat().st_size < 8000:
                     continue
                 try:
                     candidate = await shazam.recognize(str(sample_wav))
                 except Exception as exc:
-                    print(f"shazam_window_failed offset={offset} error={type(exc).__name__}: {str(exc)[:160]}")
+                    print(f"shazam_window_failed offset={offset} error={type(exc).__name__}: {str(exc)[:120]}")
                     continue
-                if candidate and candidate.get("track"):
-                    raw = candidate
-                    selected_offset = offset
-                    selected_wav = sample_wav
-                    break
+                if not candidate or not candidate.get("track"):
+                    continue
+                try:
+                    track = Serialize.full_track(candidate).track
+                except Exception:
+                    continue
+                title = (getattr(track, "title", None) or "").strip()
+                artist = (getattr(track, "subtitle", None) or "").strip()
+                if not title:
+                    continue
+                key = (title.casefold(), artist.casefold())
+                if key in recognized_tracks:
+                    recognized_tracks[key]["hits"] += 1
+                else:
+                    recognized_tracks[key] = {
+                        "title": title,
+                        "artist": artist or "نامشخص",
+                        "track": track,
+                        "offset": offset,
+                        "hits": 1,
+                    }
 
-        if not raw or not raw.get("track"):
-            return {"recognized": False, "message": "NO_CONFIDENT_MATCH"}
-        track = Serialize.full_track(raw).track
-        title = track.title or "نامشخص"
-        artist = track.subtitle or "نامشخص"
-        query = quote_plus(f"{title} {artist}")
+        if not recognized_tracks:
+            print(f"song_identification_no_match host={urlparse(url).hostname} windows={len(offsets)}")
+            return {"recognized": False, "matches": [], "message": "NO_CONFIDENT_MATCH"}
 
-        # The bot can send the identified segment itself as a short audio preview,
-        # extracted from the source Reel. It does not fetch or redistribute the full song.
-        preview_folder = MEDIA_DIR / ("preview-" + uuid.uuid4().hex)
-        preview_folder.mkdir(parents=True, exist_ok=False)
-        preview_path = preview_folder / "song-preview.mp3"
-        subprocess.run(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-ss", str(selected_offset), "-i", str(source_path), "-t", "12",
-                "-vn", "-codec:a", "libmp3lame", "-b:a", "128k", str(preview_path),
-            ],
-            check=True, capture_output=True, text=True, timeout=30,
-        )
-        preview_token = secrets.token_hex(24)
-        preview_name = safe_filename(f"{title} - {artist} (preview)", "mp3")
-        FILES[preview_token] = {
-            "path": preview_path,
-            "directory": preview_folder,
-            "expires": time.time() + FILE_TTL,
-            "filename": preview_name,
-            "ext": ".mp3",
-            "source_url": url,
-            "is_preview": True,
-        }
+        candidates = sorted(
+            recognized_tracks.values(),
+            key=lambda item: (item["hits"], -item["offset"]),
+            reverse=True,
+        )[:4]
         base = str(request.base_url).rstrip("/")
+        matches = []
+        for index, item in enumerate(candidates):
+            track = item["track"]
+            title = item["title"]
+            artist = item["artist"]
+            query = quote_plus(f"{title} {artist}")
+            preview_url = None
+            preview_folder = MEDIA_DIR / ("preview-" + uuid.uuid4().hex)
+            preview_folder.mkdir(parents=True, exist_ok=False)
+            preview_folders.append(preview_folder)
+            preview_path = preview_folder / "clip-audio-preview.mp3"
+            try:
+                await asyncio.to_thread(
+                    subprocess.run,
+                    [
+                        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-ss", str(item["offset"]), "-i", str(source_path), "-t", "12",
+                        "-vn", "-codec:a", "libmp3lame", "-b:a", "128k", str(preview_path),
+                    ],
+                    check=True, capture_output=True, text=True, timeout=30,
+                )
+                if preview_path.exists() and preview_path.stat().st_size > 1000:
+                    token = secrets.token_hex(24)
+                    FILES[token] = {
+                        "path": preview_path,
+                        "directory": preview_folder,
+                        "expires": time.time() + FILE_TTL,
+                        "filename": safe_filename(f"{title} - {artist} preview", "mp3"),
+                        "ext": ".mp3",
+                        "source_url": url,
+                        "is_preview": True,
+                    }
+                    preview_url = base + "/files/" + token
+            except Exception as exc:
+                print(f"audio_preview_failed index={index} error={type(exc).__name__}")
+
+            matches.append({
+                "id": index,
+                "title": title,
+                "artist": artist,
+                "cover": getattr(track, "photo_url", None),
+                "shazam_url": getattr(track, "shazam_url", None),
+                "apple_music_url": getattr(track, "apple_music_url", None),
+                "spotify_url": f"https://open.spotify.com/search/{query}",
+                "youtube_url": getattr(track, "youtube_link", None) or f"https://www.youtube.com/results?search_query={query}",
+                "lyrics_url": f"https://genius.com/search?q={query}",
+                "preview_url": preview_url,
+                "preview_duration_seconds": 12,
+                "preview_source": "clip",
+                "confidence_hits": item["hits"],
+            })
+
+        first = matches[0]
         return {
             "recognized": True,
-            "title": title,
-            "artist": artist,
-            "cover": track.photo_url,
-            "shazam_url": track.shazam_url,
-            "apple_music_url": track.apple_music_url,
-            "spotify_url": f"https://open.spotify.com/search/{query}",
-            "youtube_url": track.youtube_link or f"https://www.youtube.com/results?search_query={query}",
-            "preview_url": base + "/files/" + preview_token,
-            "preview_duration_seconds": 12,
-            "preview_source": "clip",
+            "title": first["title"],
+            "artist": first["artist"],
+            "cover": first["cover"],
+            "shazam_url": first["shazam_url"],
+            "apple_music_url": first["apple_music_url"],
+            "spotify_url": first["spotify_url"],
+            "youtube_url": first["youtube_url"],
+            "lyrics_url": first["lyrics_url"],
+            "preview_url": first["preview_url"],
+            "matches": matches,
         }
     except HTTPException:
         raise
     except Exception as e:
-        print(f"song identification failed ({type(e).__name__}): {str(e)[:300]}")
+        print(f"song identification failed ({type(e).__name__}): {str(e)[:240]}")
         raise HTTPException(422, "SONG_IDENTIFICATION_FAILED") from e
     finally:
         shutil.rmtree(folder, ignore_errors=True)
@@ -444,11 +500,14 @@ def download(url: str, spec: str = "best", request: Request = None):
     token = uuid.uuid4().hex + secrets.token_hex(12)
     folder = MEDIA_DIR / token
     folder.mkdir(parents=True, exist_ok=False)
+    best_video = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/best"
     selectors = {
-        "best": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/best",
-        "1080": "bv*[height<=1080]+ba/b[height<=1080]/best[height<=1080]",
-        "720": "bv*[height<=720]+ba/b[height<=720]/best[height<=720]",
-        "480": "bv*[height<=480]+ba/b[height<=480]/best[height<=480]",
+        # Pick a source that actually exists; the requested resolution is applied
+        # with ffmpeg below. This avoids Instagram's "Requested format is not available".
+        "best": best_video,
+        "1080": best_video,
+        "720": best_video,
+        "480": best_video,
         "mp3": "bestaudio/best",
     }
     settings = opts(format=selectors[spec],outtmpl=str(folder/"%(id)s.%(ext)s"),max_filesize=MAX_BYTES,
@@ -461,6 +520,51 @@ def download(url: str, spec: str = "best", request: Request = None):
         if not files:
             raise HTTPException(502,"Downloader produced no file")
         path = max(files,key=lambda p:p.stat().st_size)
+        output_width = None
+        output_height = None
+        if spec in ("720", "480", "1080") and path.suffix.lower() not in (".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus", ".flac"):
+            try:
+                probe_result = subprocess.run(
+                    ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                     "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", str(path)],
+                    check=True, capture_output=True, text=True, timeout=10,
+                )
+                dimensions = (probe_result.stdout.strip().splitlines() or [""])[0].split("x")
+                if len(dimensions) >= 2:
+                    source_width, source_height = int(dimensions[0]), int(dimensions[1])
+                    target_short, target_long = {
+                        "480": (480, 854), "720": (720, 1280), "1080": (1080, 1920)
+                    }[spec]
+                    scale = min(1.0, target_short / min(source_width, source_height),
+                                target_long / max(source_width, source_height))
+                    output_width = max(2, (int(source_width * scale) // 2) * 2)
+                    output_height = max(2, (int(source_height * scale) // 2) * 2)
+                    needs_resize = output_width < source_width or output_height < source_height
+                    needs_mp4 = path.suffix.lower() != ".mp4"
+                    if needs_resize or needs_mp4:
+                        scaled_path = folder / (path.stem + "-" + spec + "p.mp4")
+                        command = [
+                            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                            "-i", str(path),
+                        ]
+                        if needs_resize:
+                            command.extend(["-vf", f"scale={output_width}:{output_height}"])
+                        command.extend([
+                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+                            "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+                            str(scaled_path),
+                        ])
+                        subprocess.run(command, check=True, capture_output=True, text=True, timeout=120)
+                        if scaled_path.exists() and scaled_path.stat().st_size > 0:
+                            try:
+                                path.unlink()
+                            except OSError:
+                                pass
+                            path = scaled_path
+            except Exception as exc:
+                print(f"resolution_normalize_failed host={urlparse(url).hostname} spec={spec} error={type(exc).__name__}: {str(exc)[:120]}")
+                if spec == "mp3":
+                    raise
         size = path.stat().st_size
         if size > MAX_BYTES:
             raise HTTPException(413,"File exceeds 100 MB service limit")
