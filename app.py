@@ -581,6 +581,8 @@ def download(url: str, spec: str = "best", request: Request = None):
             "caption": caption,
             "description": caption,
             "duration": info.get("duration") or 0,
+            "width": output_width,
+            "height": output_height,
             "expires_in": FILE_TTL,
         }
     except HTTPException:
