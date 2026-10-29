@@ -1,4 +1,4 @@
-import os, re, time, uuid, secrets, shutil, ipaddress, subprocess, json, asyncio
+import os, re, time, uuid, secrets, shutil, ipaddress, subprocess, json, asyncio, threading
 from pathlib import Path
 from urllib.parse import urlparse, quote_plus
 from urllib.request import Request as URLRequest, urlopen
@@ -21,6 +21,8 @@ MEDIA_DIR = Path("/tmp/cf-downloader-media")
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 FILES = {}
 RATE = {}
+# Prevent concurrent yt-dlp/ffmpeg jobs from exhausting the small Render instance.
+DOWNLOAD_LOCK = threading.Lock()
 # Main platforms supported by yt-dlp. Support still depends on each site's
 # public accessibility and any anti-bot/login controls.
 ALLOWED_HOSTS = (
@@ -164,6 +166,7 @@ def _extract_download(url: str, settings: dict, folder: Path):
                 return ydl.extract_info(url, download=True)
         except Exception as exc:
             last_error = exc
+            print(f"extract_download_failed host={urlparse(url).hostname} error={type(exc).__name__}: {str(exc)[:180]}")
             _clean_attempt_files(folder)
     raise HTTPException(422, _public_extract_error(url, last_error or RuntimeError("extract failed"))) from last_error
 
@@ -499,7 +502,6 @@ def download(url: str, spec: str = "best", request: Request = None):
         raise HTTPException(400, "Unsupported format")
     token = uuid.uuid4().hex + secrets.token_hex(12)
     folder = MEDIA_DIR / token
-    folder.mkdir(parents=True, exist_ok=False)
     best_video = "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/best"
     selectors = {
         # Pick a source that actually exists; the requested resolution is applied
@@ -514,7 +516,11 @@ def download(url: str, spec: str = "best", request: Request = None):
                     restrictfilenames=True,merge_output_format="mp4",continuedl=False,nopart=True)
     if spec == "mp3":
         settings["postprocessors"]=[{"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":"192"}]
+    if not DOWNLOAD_LOCK.acquire(blocking=False):
+        raise HTTPException(429, "DOWNLOAD_BUSY")
     try:
+        folder.mkdir(parents=True, exist_ok=False)
+        print(f"download_begin host={urlparse(url).hostname} spec={spec}")
         info = _extract_download(url, settings, folder)
         files = [p for p in folder.iterdir() if p.is_file() and not p.name.endswith((".part",".ytdl",".tmp"))]
         if not files:
@@ -545,12 +551,13 @@ def download(url: str, spec: str = "best", request: Request = None):
                         scaled_path = folder / (path.stem + "-" + spec + "p.mp4")
                         command = [
                             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                            "-i", str(path),
+                            "-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
+                            "-i", str(path), "-threads", "1",
                         ]
                         if needs_resize:
                             command.extend(["-vf", f"scale={output_width}:{output_height}"])
                         command.extend([
-                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+                            "-c:v", "libx264", "-preset", "veryfast", "-crf", "26", "-threads", "1",
                             "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
                             str(scaled_path),
                         ])
@@ -590,7 +597,10 @@ def download(url: str, spec: str = "best", request: Request = None):
         raise
     except Exception as e:
         shutil.rmtree(folder,ignore_errors=True)
+        print(f"download_failed host={urlparse(url).hostname} spec={spec} error={type(e).__name__}: {str(e)[:220]}")
         raise HTTPException(422,"Download failed; this media may require login or be blocked by the platform") from e
+    finally:
+        DOWNLOAD_LOCK.release()
 
 @app.get("/files/{token}")
 def get_file(token: str):
