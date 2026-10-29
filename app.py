@@ -1,4 +1,5 @@
 import os, re, time, uuid, secrets, shutil, ipaddress, subprocess, json, asyncio, threading, base64
+from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import urlparse, quote_plus
 from urllib.request import Request as URLRequest, urlopen
@@ -145,9 +146,11 @@ def _extractor_profiles(url: str):
     # by the service owner through a private Render environment variable if needed.
     if _is_youtube(url):
         return [
-            {"youtube": {"player_client": ["mweb", "tv", "web_safari"]}},
-            {"youtube": {"player_client": ["android_vr", "tv_simply", "tv"]}},
-            {"youtube": {"player_client": ["web_embedded", "tv"]}},
+            # Try a public client without a required PO token before using mweb.
+            {"youtube": {"player_client": ["android_vr"]}},
+            {"youtube": {"player_client": ["mweb"]}},
+            {"youtube": {"player_client": ["web_safari"]}},
+            {"youtube": {"player_client": ["web_embedded"]}},
             {"youtube": {"player_client": ["tv"]}},
             None,
         ]
@@ -283,6 +286,50 @@ def safe_filename(name, ext):
     name = re.sub(r'[\x00-\x1f\x7f/\\:*?"<>|]', "_", name or "download").strip(" .")
     return (name[:120] or "download") + "." + ext
 
+
+def _normalized_track_text(value: str) -> str:
+    return re.sub(r"[\W_]+", "", (value or "").casefold(), flags=re.UNICODE)
+
+
+def _deezer_preview(title: str, artist: str) -> dict:
+    """Return an official Deezer 30-second preview when the catalogue match is close."""
+    query = quote_plus((title + " " + artist).strip())
+    request = URLRequest(
+        f"https://api.deezer.com/search?q={query}&limit=5",
+        headers={"User-Agent": "Mozilla/5.0 (compatible; MusicIdentifier/1.0)"},
+    )
+    try:
+        with urlopen(request, timeout=3) as response:
+            payload = json.loads(response.read(500_000).decode("utf-8", "replace"))
+        data = payload.get("data") or []
+    except Exception as exc:
+        print(f"deezer_preview_lookup_failed error={type(exc).__name__}")
+        return {}
+    wanted_title = _normalized_track_text(title)
+    wanted_artist = _normalized_track_text(artist)
+    best = None
+    for item in data:
+        got_title = _normalized_track_text(str(item.get("title") or "") + " " + str(item.get("title_version") or ""))
+        got_artist = _normalized_track_text((item.get("artist") or {}).get("name") or "")
+        if not got_title or not got_artist:
+            continue
+        title_score = SequenceMatcher(None, wanted_title, got_title).ratio()
+        artist_score = SequenceMatcher(None, wanted_artist, got_artist).ratio()
+        if wanted_title and (wanted_title in got_title or got_title in wanted_title):
+            title_score = max(title_score, 0.92)
+        if wanted_artist and (wanted_artist in got_artist or got_artist in wanted_artist):
+            artist_score = max(artist_score, 0.92)
+        score = 0.7 * title_score + 0.3 * artist_score
+        if best is None or score > best[0]:
+            best = (score, item)
+    if not best or best[0] < 0.72:
+        return {}
+    item = best[1]
+    preview = item.get("preview") or ""
+    if not preview.startswith("https://"):
+        return {}
+    return {"deezer_preview_url": preview, "deezer_url": item.get("link") or ""}
+
 @app.get("/")
 def root():
     return {"service":APP_NAME,"ok":True,"endpoints":["/health","/probe?url=...","/download?url=...&spec=best","/identify?url=..."]}
@@ -394,14 +441,14 @@ async def identify(url: str, request: Request):
             await asyncio.to_thread(
                 subprocess.run,
                 ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-threads", "1",
-                 "-i", str(source_path), "-t", str(min(media_duration or 1800.0, 1800.0)),
+                 "-i", str(source_path), "-t", "30",
                  "-vn", "-codec:a", "libmp3lame", "-b:a", "128k", str(clip_audio_path)],
                 check=True, capture_output=True, text=True, timeout=120,
             )
             if clip_audio_path.exists() and 1000 < clip_audio_path.stat().st_size <= MAX_BYTES:
                 clip_token = secrets.token_hex(24)
                 clip_audio_size = clip_audio_path.stat().st_size
-                clip_audio_filename = safe_filename("Audio from supplied clip", "mp3")
+                clip_audio_filename = safe_filename("Audio preview from supplied clip", "mp3")
                 FILES[clip_token] = {
                     "path": clip_audio_path,
                     "directory": clip_audio_folder,
@@ -480,7 +527,7 @@ async def identify(url: str, request: Request):
 
         if not recognized_tracks:
             print(f"song_identification_no_match host={urlparse(url).hostname} windows={len(offsets)}")
-            return {"recognized": False, "matches": [], "message": "NO_CONFIDENT_MATCH", "clip_audio_url": clip_audio_url, "clip_audio_size": clip_audio_size, "clip_audio_filename": clip_audio_filename, "clip_audio_duration_seconds": min(media_duration or 0, 1800)}
+            return {"recognized": False, "matches": [], "message": "NO_CONFIDENT_MATCH", "clip_audio_url": clip_audio_url, "clip_audio_size": clip_audio_size, "clip_audio_filename": clip_audio_filename, "clip_audio_duration_seconds": min(media_duration or 0, 30)}
 
         candidates = sorted(
             recognized_tracks.values(),
@@ -493,6 +540,7 @@ async def identify(url: str, request: Request):
             title = item["title"]
             artist = item["artist"]
             query = quote_plus(f"{title} {artist}")
+            deezer_preview = await asyncio.to_thread(_deezer_preview, title, artist)
             preview_url = None
             preview_folder = MEDIA_DIR / ("preview-" + uuid.uuid4().hex)
             preview_folder.mkdir(parents=True, exist_ok=False)
@@ -533,6 +581,8 @@ async def identify(url: str, request: Request):
                 "spotify_url": f"https://open.spotify.com/search/{query}",
                 "youtube_url": getattr(track, "youtube_link", None) or f"https://www.youtube.com/results?search_query={query}",
                 "lyrics_url": f"https://genius.com/search?q={query}",
+                "deezer_preview_url": deezer_preview.get("deezer_preview_url"),
+                "deezer_url": deezer_preview.get("deezer_url"),
                 "preview_url": preview_url,
                 "preview_duration_seconds": 12,
                 "preview_source": "clip",
@@ -554,7 +604,7 @@ async def identify(url: str, request: Request):
             "clip_audio_url": clip_audio_url,
             "clip_audio_size": clip_audio_size,
             "clip_audio_filename": clip_audio_filename,
-            "clip_audio_duration_seconds": min(media_duration or 0, 1800),
+            "clip_audio_duration_seconds": min(media_duration or 0, 30),
             "matches": matches,
         }
     except HTTPException:
