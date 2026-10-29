@@ -1,10 +1,11 @@
 import os, re, time, uuid, secrets, shutil, ipaddress
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote_plus
 
 from fastapi import FastAPI, Header, HTTPException, Request, Depends
 from fastapi.responses import FileResponse
 from yt_dlp import YoutubeDL
+from shazamio import Serialize, Shazam
 
 APP_NAME = "cf-downloader-api"
 API_KEY = os.environ.get("API_KEY", "")
@@ -113,6 +114,59 @@ def recognize(url: str, request: Request):
     if not title and not artist:
         return {"title":None,"artist":None}
     return {"title":title or "نامشخص","artist":artist or "نامشخص","cover":info.get("thumbnail"),"duration":info.get("duration"),"source":"metadata"}
+
+
+@app.get("/identify", dependencies=[Depends(auth)])
+async def identify(url: str, request: Request):
+    """Identify music in a public clip using Shazam's current recognition service."""
+    rate_limit(request)
+    clean_files()
+    validate_url(url)
+    token = uuid.uuid4().hex
+    folder = MEDIA_DIR / ("identify-" + token)
+    folder.mkdir(parents=True, exist_ok=False)
+    try:
+        settings = opts(
+            format="bestaudio/best",
+            outtmpl=str(folder / "%(id)s.%(ext)s"),
+            max_filesize=MAX_BYTES,
+            restrictfilenames=True,
+            continuedl=False,
+            nopart=True,
+        )
+        with YoutubeDL(settings) as ydl:
+            ydl.extract_info(url, download=True)
+        files = [
+            p for p in folder.iterdir()
+            if p.is_file() and not p.name.endswith((".part", ".ytdl", ".tmp"))
+        ]
+        if not files:
+            raise HTTPException(502, "Audio extraction produced no file")
+        audio_path = max(files, key=lambda p: p.stat().st_size)
+        async with Shazam() as shazam:
+            raw = await shazam.recognize(str(audio_path), max_skew=1e-3)
+        if not raw or not raw.get("track"):
+            return {"recognized": False, "message": "No confident song match"}
+        track = Serialize.full_track(raw).track
+        title = track.title or "نامشخص"
+        artist = track.subtitle or "نامشخص"
+        query = quote_plus(f"{title} {artist}")
+        return {
+            "recognized": True,
+            "title": title,
+            "artist": artist,
+            "cover": track.photo_url,
+            "shazam_url": track.shazam_url,
+            "apple_music_url": track.apple_music_url,
+            "spotify_url": f"https://open.spotify.com/search/{query}",
+            "youtube_url": track.youtube_link or f"https://www.youtube.com/results?search_query={query}",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(422, "Song identification failed; try another public clip") from e
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
 
 @app.get("/download", dependencies=[Depends(auth)])
 def download(url: str, spec: str = "best", request: Request = None):
