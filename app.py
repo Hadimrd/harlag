@@ -17,11 +17,25 @@ MEDIA_DIR = Path("/tmp/cf-downloader-media")
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 FILES = {}
 RATE = {}
+# Main platforms supported by yt-dlp. Support still depends on each site's
+# public accessibility and any anti-bot/login controls.
 ALLOWED_HOSTS = (
-    "youtube.com", "youtu.be", "youtube-nocookie.com", "instagram.com",
-    "tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "facebook.com",
-    "fb.watch", "x.com", "twitter.com"
+    "youtube.com", "youtu.be", "youtube-nocookie.com", "youtubekids.com",
+    "instagram.com", "tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "douyin.com",
+    "facebook.com", "fb.watch", "m.facebook.com", "x.com", "twitter.com",
+    "reddit.com", "redd.it", "v.redd.it", "vimeo.com", "dailymotion.com", "dai.ly",
+    "twitch.tv", "clips.twitch.tv", "soundcloud.com", "on.soundcloud.com", "bandcamp.com",
+    "streamable.com", "pinterest.com", "pin.it", "snapchat.com", "story.snapchat.com",
+    "threads.net", "tumblr.com", "linkedin.com", "rumble.com", "bilibili.com",
+    "bilibili.tv", "b23.tv", "aparat.com", "namasha.com", "archive.org",
+    "mixcloud.com", "odysee.com", "vk.com", "vkvideo.ru", "ok.ru",
+    "likee.video", "kwai.com", "capcut.com", "loom.com", "imgur.com",
+    "giphy.com", "coub.com", "9gag.com", "medal.tv", "streamja.com",
+    "kick.com", "patreon.com", "tnaflix.com", "flickr.com", "photobucket.com",
+    "bitchute.com", "brighteon.com", "rumble.com", "weverse.io", "weibo.com",
+    "xiaohongshu.com", "xhslink.com"
 )
+YOUTUBE_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com", "youtubekids.com")
 FORMATS = [
     {"id":"best","label":"🎬 بهترین کیفیت","ext":"mp4"},
     {"id":"1080","label":"🎬 1080p","ext":"mp4"},
@@ -63,19 +77,84 @@ def rate_limit(request: Request):
 def opts(**extra):
     return {"quiet":True,"no_warnings":True,"noplaylist":True,"socket_timeout":20,"retries":1,"extractor_retries":1,"cachedir":False,**extra}
 
+def _is_youtube(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    return any(host == h or host.endswith("." + h) for h in YOUTUBE_HOSTS)
+
+
+def _extractor_profiles(url: str):
+    # YouTube increasingly challenges datacenter IPs. Try the TV/Safari clients
+    # first, then the default extractor profile; all other sites use the default.
+    if _is_youtube(url):
+        return [
+            {"youtube": {"player_client": ["tv", "web_safari"]}},
+            {"youtube": {"player_client": ["tv"]}},
+            None,
+        ]
+    return [None]
+
+
+def _public_extract_error(url: str, exc: Exception) -> str:
+    message = str(exc).lower()
+    if _is_youtube(url) and any(
+        marker in message for marker in
+        ("sign in to confirm", "not a bot", "confirm you're not a bot", "po token", "proof of origin")
+    ):
+        return "YOUTUBE_BOT_CHECK"
+    if any(marker in message for marker in ("private", "login required", "sign in to view", "members-only")):
+        return "MEDIA_REQUIRES_LOGIN"
+    return "MEDIA_UNAVAILABLE"
+
+
+def _clean_attempt_files(folder: Path):
+    for item in folder.iterdir():
+        try:
+            shutil.rmtree(item) if item.is_dir() else item.unlink()
+        except OSError:
+            pass
+
+
+def _extract_download(url: str, settings: dict, folder: Path):
+    last_error = None
+    for extractor_args in _extractor_profiles(url):
+        attempt_settings = dict(settings)
+        if extractor_args:
+            attempt_settings["extractor_args"] = extractor_args
+        else:
+            attempt_settings.pop("extractor_args", None)
+        try:
+            with YoutubeDL(attempt_settings) as ydl:
+                return ydl.extract_info(url, download=True)
+        except Exception as exc:
+            last_error = exc
+            _clean_attempt_files(folder)
+    raise HTTPException(422, _public_extract_error(url, last_error or RuntimeError("extract failed"))) from last_error
+
+
 def get_info(url: str):
     validate_url(url)
-    try:
-        with YoutubeDL(opts(skip_download=True)) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:
-        raise HTTPException(422, "Could not read this media URL; it may be private, unsupported or blocked") from e
+    last_error = None
+    info = None
+    for extractor_args in _extractor_profiles(url):
+        settings = opts(skip_download=True)
+        if extractor_args:
+            settings["extractor_args"] = extractor_args
+        try:
+            with YoutubeDL(settings) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info:
+                break
+        except Exception as exc:
+            last_error = exc
     if not info:
-        raise HTTPException(422, "No media found")
+        if last_error:
+            print(f"extract_info_failed host={urlparse(url).hostname} error={type(last_error).__name__}: {str(last_error)[:240]}")
+            raise HTTPException(422, _public_extract_error(url, last_error)) from last_error
+        raise HTTPException(422, "MEDIA_UNAVAILABLE")
     if info.get("is_live"):
-        raise HTTPException(422, "Live streams are not supported")
+        raise HTTPException(422, "LIVE_STREAM_UNSUPPORTED")
     if info.get("duration") and info["duration"] > MAX_DURATION:
-        raise HTTPException(413, "Media must be 30 minutes or shorter")
+        raise HTTPException(413, "MEDIA_TOO_LONG_MAX_30_MIN")
     return info
 
 def clean_files():
@@ -147,8 +226,7 @@ async def identify(url: str, request: Request):
                 continuedl=False,
                 nopart=True,
             )
-            with YoutubeDL(settings) as ydl:
-                ydl.extract_info(url, download=True)
+            _extract_download(url, settings, folder)
             audio_files = [
                 p for p in folder.iterdir()
                 if p.is_file() and not p.name.endswith((".part", ".ytdl", ".tmp"))
@@ -207,9 +285,9 @@ def download(url: str, spec: str = "best", request: Request = None):
     folder.mkdir(parents=True, exist_ok=False)
     selectors = {
         "best": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/best",
-        "1080": "bv*[height<=1080]+ba/b[height<=1080]/best[height<=1080]/best",
-        "720": "bv*[height<=720]+ba/b[height<=720]/best[height<=720]/best",
-        "480": "bv*[height<=480]+ba/b[height<=480]/best[height<=480]/best",
+        "1080": "bv*[height<=1080]+ba/b[height<=1080]/best[height<=1080]",
+        "720": "bv*[height<=720]+ba/b[height<=720]/best[height<=720]",
+        "480": "bv*[height<=480]+ba/b[height<=480]/best[height<=480]",
         "mp3": "bestaudio/best",
     }
     settings = opts(format=selectors[spec],outtmpl=str(folder/"%(id)s.%(ext)s"),max_filesize=MAX_BYTES,
@@ -217,8 +295,7 @@ def download(url: str, spec: str = "best", request: Request = None):
     if spec == "mp3":
         settings["postprocessors"]=[{"key":"FFmpegExtractAudio","preferredcodec":"mp3","preferredquality":"192"}]
     try:
-        with YoutubeDL(settings) as ydl:
-            info = ydl.extract_info(url, download=True)
+        info = _extract_download(url, settings, folder)
         files = [p for p in folder.iterdir() if p.is_file() and not p.name.endswith((".part",".ytdl",".tmp"))]
         if not files:
             raise HTTPException(502,"Downloader produced no file")
