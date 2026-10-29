@@ -118,36 +118,56 @@ def recognize(url: str, request: Request):
 
 @app.get("/identify", dependencies=[Depends(auth)])
 async def identify(url: str, request: Request):
-    """Identify music in a public clip using Shazam's current recognition service."""
+    """Identify music from a previously downloaded clip whenever possible."""
     rate_limit(request)
     clean_files()
     validate_url(url)
-    token = uuid.uuid4().hex
-    folder = MEDIA_DIR / ("identify-" + token)
+    folder = MEDIA_DIR / ("identify-" + uuid.uuid4().hex)
     folder.mkdir(parents=True, exist_ok=False)
     try:
-        settings = opts(
-            format="bestaudio/best",
-            outtmpl=str(folder / "%(id)s.%(ext)s"),
-            max_filesize=MAX_BYTES,
-            restrictfilenames=True,
-            continuedl=False,
-            nopart=True,
+        # Reuse the media already downloaded for Telegram instead of fetching the
+        # entire Reel a second time. This is both faster and less likely to be blocked.
+        cached = next(
+            (
+                item for item in FILES.values()
+                if item.get("source_url") == url
+                and item["expires"] > time.time()
+                and item["path"].exists()
+            ),
+            None,
         )
-        with YoutubeDL(settings) as ydl:
-            ydl.extract_info(url, download=True)
-        files = [
-            p for p in folder.iterdir()
-            if p.is_file() and not p.name.endswith((".part", ".ytdl", ".tmp"))
-        ]
-        if not files:
-            raise HTTPException(502, "Audio extraction produced no file")
-        audio_path = max(files, key=lambda p: p.stat().st_size)
+        if cached:
+            source_path = cached["path"]
+        else:
+            settings = opts(
+                format="bestaudio/best",
+                outtmpl=str(folder / "%(id)s.%(ext)s"),
+                max_filesize=MAX_BYTES,
+                restrictfilenames=True,
+                continuedl=False,
+                nopart=True,
+            )
+            with YoutubeDL(settings) as ydl:
+                ydl.extract_info(url, download=True)
+            audio_files = [
+                p for p in folder.iterdir()
+                if p.is_file() and not p.name.endswith((".part", ".ytdl", ".tmp"))
+            ]
+            if not audio_files:
+                raise HTTPException(502, "Audio extraction produced no file")
+            source_path = max(audio_files, key=lambda p: p.stat().st_size)
+
         normalized_audio = folder / "shazam-sample.wav"
         subprocess.run(
-            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(audio_path),
-             "-t", "12", "-vn", "-ac", "2", "-ar", "44100", "-f", "wav", str(normalized_audio)],
-            check=True, capture_output=True, text=True, timeout=30
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(source_path), "-t", "12", "-vn", "-ac", "2",
+                "-ar", "44100", "-f", "wav", str(normalized_audio),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         async with Shazam() as shazam:
             raw = await shazam.recognize(str(normalized_audio))
@@ -207,7 +227,7 @@ def download(url: str, spec: str = "best", request: Request = None):
         if size > MAX_BYTES:
             raise HTTPException(413,"File exceeds 100 MB service limit")
         filename = safe_filename(info.get("title") or path.stem,path.suffix.lstrip("."))
-        FILES[token]={"path":path,"directory":folder,"expires":time.time()+FILE_TTL,"filename":filename,"ext":path.suffix.lower()}
+        FILES[token]={"path":path,"directory":folder,"expires":time.time()+FILE_TTL,"filename":filename,"ext":path.suffix.lower(),"source_url":url}
         base = str(request.base_url).rstrip("/") if request else ""
         caption = (info.get("description") or info.get("caption") or info.get("alt_title") or "").strip()
         return {
