@@ -1,6 +1,8 @@
-import os, re, time, uuid, secrets, shutil, ipaddress, subprocess
+import os, re, time, uuid, secrets, shutil, ipaddress, subprocess, json
 from pathlib import Path
 from urllib.parse import urlparse, quote_plus
+from urllib.request import Request as URLRequest, urlopen
+from html import unescape
 
 from fastapi import FastAPI, Header, HTTPException, Request, Depends
 from fastapi.responses import FileResponse
@@ -195,6 +197,62 @@ def clean_files():
             shutil.rmtree(item["directory"], ignore_errors=True)
             FILES.pop(key, None)
 
+def _is_instagram_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower().rstrip(".")
+    return host == "instagram.com" or host.endswith(".instagram.com")
+
+
+def _instagram_caption_fallback(url: str) -> str:
+    # Public Instagram pages sometimes expose the caption in embedded JSON even
+    # when the extractor metadata field is blank. Keep this best-effort and fast.
+    try:
+        request = URLRequest(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.8",
+            },
+        )
+        with urlopen(request, timeout=4) as response:
+            page = response.read(1_500_000).decode("utf-8", "replace")
+    except Exception as exc:
+        print(f"instagram_caption_fallback_failed: {type(exc).__name__}")
+        return ""
+    patterns = (
+        r'"edge_media_to_caption"\\s*:\\s*\\{.*?"text"\\s*:\\s*("(?:\\\\.|[^"\\\\])*")',
+        r'"caption"\\s*:\\s*\\{\\s*"text"\\s*:\\s*("(?:\\\\.|[^"\\\\])*")',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, page, re.S)
+        if match:
+            try:
+                caption = str(json.loads(match.group(1))).strip()
+                if caption:
+                    return caption[:4000]
+            except (ValueError, TypeError):
+                pass
+    # Last resort: some public pages include the caption in Open Graph metadata.
+    meta_patterns = (
+        r'<meta[^>]+(?:property|name)=["\\'](?:og:description|description)["\\'][^>]+content=["\\']([^"\\']*)',
+        r'<meta[^>]+content=["\\']([^"\\']*)["\\'][^>]+(?:property|name)=["\\'](?:og:description|description)["\\']',
+    )
+    for pattern in meta_patterns:
+        match = re.search(pattern, page, re.I)
+        if match:
+            value = unescape(match.group(1)).strip()
+            if value and not value.lower().startswith(("log in", "instagram")):
+                return value[:4000]
+    return ""
+
+
+def media_caption(url: str, info: dict) -> str:
+    caption = media_caption(url, info)
+        print(f"download_ok host={urlparse(url).hostname} size={size} caption_chars={len(caption)}")
+    if not caption and _is_instagram_url(url):
+        caption = _instagram_caption_fallback(url)
+    return caption
+
+
 def safe_filename(name, ext):
     name = re.sub(r'[\x00-\x1f\x7f/\\:*?"<>|]', "_", name or "download").strip(" .")
     return (name[:120] or "download") + "." + ext
@@ -211,7 +269,7 @@ def health():
 def probe(url: str, request: Request):
     rate_limit(request)
     info = get_info(url)
-    return {"url":url,"title":info.get("title") or "بدون عنوان","caption":(info.get("description") or info.get("caption") or info.get("alt_title") or "").strip(),"duration":info.get("duration") or 0,
+    return {"url":url,"title":info.get("title") or "بدون عنوان","caption":media_caption(url, info),"duration":info.get("duration") or 0,
             "thumbnail":info.get("thumbnail") or "","filesize":info.get("filesize") or info.get("filesize_approx") or 0,
             "artist":info.get("artist") or info.get("creator"),"song":info.get("track"),"formats":FORMATS}
 
