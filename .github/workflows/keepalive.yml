@@ -1,4 +1,5 @@
 name: Keep Render API warm
+# Push/manual runs configure the webhook; scheduled runs only health-check Render.
 on:
   push:
     branches: [main]
