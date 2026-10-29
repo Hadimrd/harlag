@@ -1,6 +1,6 @@
 fastapi>=0.115,<1
 uvicorn[standard]>=0.34,<1
-yt-dlp[default]
+yt-dlp[default]>=2026.10.26,<2027.0
 shazamio>=0.8,<1
 bgutil-ytdlp-pot-provider>=2.0,<3
 
