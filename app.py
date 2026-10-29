@@ -120,8 +120,11 @@ def _extractor_profiles(url: str):
     # YouTube increasingly challenges datacenter IPs. Try the TV/Safari clients
     # first, then the default extractor profile; all other sites use the default.
     if _is_youtube(url):
+        # The local bgutil provider can generate the PO tokens required by mweb/web clients.
+        # Keep the TV client as a fallback for videos with fewer supported formats.
         return [
-            {"youtube": {"player_client": ["tv", "web_safari"]}},
+            {"youtube": {"player_client": ["mweb", "tv", "web_safari"]}},
+            {"youtube": {"player_client": ["web_embedded", "tv"]}},
             {"youtube": {"player_client": ["tv"]}},
             None,
         ]
