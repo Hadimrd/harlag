@@ -170,11 +170,11 @@ def safe_filename(name, ext):
 
 @app.get("/")
 def root():
-    return {"service":APP_NAME,"ok":True,"endpoints":["/health","/probe?url=...","/download?url=...&spec=best"]}
+    return {"service":APP_NAME,"ok":True,"endpoints":["/health","/probe?url=...","/download?url=...&spec=best","/identify?url=..."]}
 
 @app.get("/health")
 def health():
-    return {"ok":True,"service":APP_NAME,"api_key_configured":bool(API_KEY)}
+    return {"ok":True,"service":APP_NAME,"api_key_configured":bool(API_KEY),"yt_dlp":"enabled","music_recognition":"shazamio"}
 
 @app.get("/probe", dependencies=[Depends(auth)])
 def probe(url: str, request: Request):
@@ -197,26 +197,29 @@ def recognize(url: str, request: Request):
 
 @app.get("/identify", dependencies=[Depends(auth)])
 async def identify(url: str, request: Request):
-    """Identify music from a previously downloaded clip whenever possible."""
+    """Identify a track from several 12-second windows and return a short clip-derived audio sample."""
     rate_limit(request)
     clean_files()
     validate_url(url)
     folder = MEDIA_DIR / ("identify-" + uuid.uuid4().hex)
     folder.mkdir(parents=True, exist_ok=False)
+    preview_folder = None
+    preview_token = None
     try:
-        # Reuse the media already downloaded for Telegram instead of fetching the
-        # entire Reel a second time. This is both faster and less likely to be blocked.
+        # Reuse the already-downloaded media where possible to avoid a second full download.
         cached = next(
             (
                 item for item in FILES.values()
                 if item.get("source_url") == url
                 and item["expires"] > time.time()
                 and item["path"].exists()
+                and not item.get("is_preview")
             ),
             None,
         )
         if cached:
             source_path = cached["path"]
+            media_duration = 0.0
         else:
             settings = opts(
                 format="bestaudio/best",
@@ -226,35 +229,92 @@ async def identify(url: str, request: Request):
                 continuedl=False,
                 nopart=True,
             )
-            _extract_download(url, settings, folder)
+            info = _extract_download(url, settings, folder)
             audio_files = [
                 p for p in folder.iterdir()
-                if p.is_file() and not p.name.endswith((".part", ".ytdl", ".tmp"))
+                if p.is_file() and not p.name.endswith((".part", ".ytdl", ".tmp", ".wav"))
             ]
             if not audio_files:
-                raise HTTPException(502, "Audio extraction produced no file")
+                raise HTTPException(502, "AUDIO_EXTRACTION_FAILED")
             source_path = max(audio_files, key=lambda p: p.stat().st_size)
+            media_duration = float(info.get("duration") or 0)
 
-        normalized_audio = folder / "shazam-sample.wav"
-        subprocess.run(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-i", str(source_path), "-t", "12", "-vn", "-ac", "2",
-                "-ar", "44100", "-f", "wav", str(normalized_audio),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
+        if not media_duration:
+            try:
+                probe_result = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", str(source_path)],
+                    check=True, capture_output=True, text=True, timeout=10,
+                )
+                media_duration = max(0.0, float(probe_result.stdout.strip() or 0))
+            except Exception:
+                media_duration = 0.0
+
+        # A song may begin after speech or an intro. Check up to three distinct 12 s windows.
+        offsets = [0.0]
+        if media_duration > 12:
+            offsets.extend([max(0.0, media_duration / 2 - 6), max(0.0, media_duration - 12)])
+        offsets = list(dict.fromkeys(round(x, 2) for x in offsets))[:3]
+
+        selected_offset = offsets[0]
+        selected_wav = None
+        raw = None
         async with Shazam() as shazam:
-            raw = await shazam.recognize(str(normalized_audio))
+            for index, offset in enumerate(offsets):
+                sample_wav = folder / f"sample-{index}.wav"
+                subprocess.run(
+                    [
+                        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                        "-ss", str(offset), "-i", str(source_path), "-t", "12",
+                        "-vn", "-ac", "2", "-ar", "44100", "-f", "wav", str(sample_wav),
+                    ],
+                    check=True, capture_output=True, text=True, timeout=30,
+                )
+                if not sample_wav.exists() or sample_wav.stat().st_size < 8000:
+                    continue
+                try:
+                    candidate = await shazam.recognize(str(sample_wav))
+                except Exception as exc:
+                    print(f"shazam_window_failed offset={offset} error={type(exc).__name__}: {str(exc)[:160]}")
+                    continue
+                if candidate and candidate.get("track"):
+                    raw = candidate
+                    selected_offset = offset
+                    selected_wav = sample_wav
+                    break
+
         if not raw or not raw.get("track"):
-            return {"recognized": False, "message": "No confident song match"}
+            return {"recognized": False, "message": "NO_CONFIDENT_MATCH"}
         track = Serialize.full_track(raw).track
         title = track.title or "نامشخص"
         artist = track.subtitle or "نامشخص"
         query = quote_plus(f"{title} {artist}")
+
+        # The bot can send the identified segment itself as a short audio preview,
+        # extracted from the source Reel. It does not fetch or redistribute the full song.
+        preview_folder = MEDIA_DIR / ("preview-" + uuid.uuid4().hex)
+        preview_folder.mkdir(parents=True, exist_ok=False)
+        preview_path = preview_folder / "song-preview.mp3"
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", str(selected_offset), "-i", str(source_path), "-t", "12",
+                "-vn", "-codec:a", "libmp3lame", "-b:a", "128k", str(preview_path),
+            ],
+            check=True, capture_output=True, text=True, timeout=30,
+        )
+        preview_token = secrets.token_hex(24)
+        preview_name = safe_filename(f"{title} - {artist} (preview)", "mp3")
+        FILES[preview_token] = {
+            "path": preview_path,
+            "directory": preview_folder,
+            "expires": time.time() + FILE_TTL,
+            "filename": preview_name,
+            "ext": ".mp3",
+            "source_url": url,
+            "is_preview": True,
+        }
+        base = str(request.base_url).rstrip("/")
         return {
             "recognized": True,
             "title": title,
@@ -264,12 +324,15 @@ async def identify(url: str, request: Request):
             "apple_music_url": track.apple_music_url,
             "spotify_url": f"https://open.spotify.com/search/{query}",
             "youtube_url": track.youtube_link or f"https://www.youtube.com/results?search_query={query}",
+            "preview_url": base + "/files/" + preview_token,
+            "preview_duration_seconds": 12,
+            "preview_source": "clip",
         }
     except HTTPException:
         raise
     except Exception as e:
         print(f"song identification failed ({type(e).__name__}): {str(e)[:300]}")
-        raise HTTPException(422, "Song identification failed; try another public clip") from e
+        raise HTTPException(422, "SONG_IDENTIFICATION_FAILED") from e
     finally:
         shutil.rmtree(folder, ignore_errors=True)
 
